@@ -5,71 +5,165 @@
 terraform {
   required_providers {
     aws = {
-      source  = "hashicorp/aws"
-      version = "4.52.0"
-    }
-    random = {
-      source  = "hashicorp/random"
-      version = "3.4.3"
+      source = "hashicorp/aws"
+      version = "5.31.0"
     }
   }
-  required_version = ">= 1.1.0"
 }
 
 provider "aws" {
-  region = "us-west-2"
+ region     = "us-east-1"
 }
 
-resource "random_pet" "sg" {}
 
-data "aws_ami" "ubuntu" {
-  most_recent = true
+#systemctl status apache2
 
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*"]
+#Create VPC
+
+resource "aws_vpc" "prod-vpc" {
+  cidr_block       = "10.0.0.0/16"
+  instance_tenancy = "default"
+
+  tags = {
+    Name = "Prod VPC"
   }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-
-  owners = ["099720109477"] # Canonical
 }
 
-resource "aws_instance" "web" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "t2.micro"
-  vpc_security_group_ids = [aws_security_group.web-sg.id]
+#Create Internet Gateway
+
+resource "aws_internet_gateway" "prod-ig" {
+  vpc_id = aws_vpc.prod-vpc.id
+
+  tags = {
+    Name = "Prod IG"
+  }
+}
+
+#Route Table
+
+resource "aws_route_table" "prod-rt" {
+  vpc_id = aws_vpc.prod-vpc.id
+
+  route {#IPv4
+    cidr_block = "0.0.0.0/0" #Point all IPv4 traffic to our internet gateway
+    gateway_id = aws_internet_gateway.prod-ig.id
+  }
+
+  route {
+    ipv6_cidr_block        = "::/0" #Point all IPv6 traffic to our internet gateway
+    gateway_id = aws_internet_gateway.prod-ig.id
+  }
+
+  tags = {
+    Name = "VPC RT"
+  }
+}
+
+
+#Create Subnet
+
+resource "aws_subnet" "subnet-1" {
+  vpc_id     = aws_vpc.prod-vpc.id #Ref our vpc
+  cidr_block = "10.0.1.0/24"
+  availability_zone = "us-east-1a"
+
+  tags = {
+    Name = "prod-subnet"
+  }
+}
+
+#Associate Subnet with Route table
+
+resource "aws_route_table_association" "a" {
+  subnet_id      = aws_subnet.subnet-1.id
+  route_table_id = aws_route_table.prod-rt.id
+}
+
+#Create Security Group to allow port 22,80,443 (SSH, HTTP, HTTPS)
+
+resource "aws_security_group" "allow_web" {
+  name        = "allow_web"
+  description = "Allow Web traffic"
+  vpc_id      = aws_vpc.prod-vpc.id
+
+  ingress {
+    description      = "HTTPS"
+    from_port        = 443
+    to_port          = 443
+    protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description      = "HTTP"
+    from_port        = 80
+    to_port          = 80
+    protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description      = "SSH"
+    from_port        = 22
+    to_port          = 22
+    protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  tags = {
+    Name = "allow_web"
+  }
+}
+
+#Create network interface
+
+resource "aws_network_interface" "web-ni" {
+  subnet_id       = aws_subnet.subnet-1.id
+  private_ips     = ["10.0.1.50"]
+  security_groups = [aws_security_group.allow_web.id]
+
+}
+
+#Assign Elastic IP to network interface
+
+resource "aws_eip" "one" {
+  domain                    = "vpc"
+  network_interface         = aws_network_interface.web-ni.id
+  associate_with_private_ip = "10.0.1.50"
+  depends_on = [aws_internet_gateway.prod-ig, aws_instance.server]
+}
+
+#Crete Ubuntu Server with apache2
+
+resource "aws_instance" "server" {
+  ami           = "ami-0c7217cdde317cfec"
+  instance_type = "t2.micro"
+  availability_zone = "us-east-1a"
+  key_name = "tkey"
+
+  tags = {
+    Name = "My Terra Server"
+  }
+
+  network_interface {
+    device_index = 0
+    network_interface_id = aws_network_interface.web-ni.id
+  }
 
   user_data = <<-EOF
-              #!/bin/bash
-              apt-get update
-              apt-get install -y apache2
-              sed -i -e 's/80/8080/' /etc/apache2/ports.conf
-              echo "Hello World" > /var/www/html/index.html
-              systemctl restart apache2
-              EOF
+                #!/bin/bash
+                sudo apt update -y
+                sudo apt install apache2 -y
+                sudo systemctl start apache2
+                sudo bash -c 'echo Aarons web server > /var/www/html/index.html'
+                EOF
 }
 
-resource "aws_security_group" "web-sg" {
-  name = "${random_pet.sg.id}-sg"
-  ingress {
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  // connectivity to ubuntu mirrors is required to run `apt-get update` and `apt-get install apache2`
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-output "web-address" {
-  value = "${aws_instance.web.public_dns}:8080"
-}
