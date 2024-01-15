@@ -150,7 +150,7 @@ resource "aws_instance" "server" {
   key_name = "tkey"
 
   tags = {
-    Name = "Our Terra Server"
+    Name = "Just Terra Server"
   }
 
   network_interface {
